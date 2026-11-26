@@ -127,9 +127,10 @@ fn handle_api_post_inner(
             let workspace = require_workspace(&body)?;
             let file_path = body.file_path.clone().ok_or("filePath is required")?;
             let message = require_message(&body)?;
-            let manager = manager(workspace);
-            manager.add(file_path)?;
-            let records = manager.commit_tracked_changes(message)?;
+            let records: Vec<_> = manager(workspace)
+                .commit_file(&file_path, &message)?
+                .into_iter()
+                .collect();
             Ok(serde_json::json!({ "ok": true, "records": records }))
         }
         "/api/commit" => {

@@ -1,8 +1,8 @@
 # OVC
 
 OVC is a desktop version-control tool for Office files. It is now built with a
-Rust core and a Tauri desktop GUI. The CLI and Electron/TypeScript runtime have
-been removed.
+Rust core and a Tauri desktop GUI, with a standalone command-line interface
+for local automation.
 
 OVC supports `.docx`, `.xlsx`, and `.pptx`. It stores Office files as
 content-addressed package parts, so unchanged internal files can be reused
@@ -79,16 +79,30 @@ src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/
 
 ## Desktop App Usage
 
-1. Open OVC.
-2. Click `Workspace` and choose a folder.
-3. Click `Init` to create `.office-vcs/`.
-4. Click `Track files` and choose `.docx`, `.xlsx`, or `.pptx` files.
-5. Enter a commit message.
-6. Click `Commit detected changes`.
-7. After editing tracked files, return to OVC and click `Commit detected changes` again.
+1. Open **Workspace → Choose folder**.
+2. Use **Workspace → Initialize repository** to create `.office-vcs/`.
+3. Use **Workspace → Add files** to track and stage `.docx`, `.xlsx`, or `.pptx` files.
+4. After editing a tracked file, use **Stage** beside it under **Changes**.
+5. Enter a commit message and click **Commit staged**.
 
-The app automatically detects modified tracked files. New files still need to be
-selected once with `Track files`.
+**Stage** captures the saved file at that moment. Further edits appear under
+**Changes** until you stage them again. Click a file under **Staged** to compare
+that snapshot with its latest commit, or under **Changes** to compare the saved
+file with its staged snapshot or latest commit. Use **Text** and **Images** to
+inspect the differences.
+
+### AI commit messages
+
+Open **Workspace → AI API settings** and choose OpenAI Chat Completions or
+Anthropic Messages. Enter an API base URL, model name and API key. Enable
+**Model supports images** to include supported changed-image previews.
+With files staged, click **AI draft** to generate a commit message for review.
+OVC sends excerpts of staged changes to the configured endpoint and fills the
+commit message field when it receives a response.
+
+The settings and API key are saved in the app's user configuration directory.
+On Windows the default path is `%APPDATA%\com.ovc.desktop\ai-settings.json`.
+The API key is stored in plain text. The settings dialog shows the exact path.
 
 ## Office Add-in
 
@@ -168,11 +182,60 @@ right-click the task pane title bar and choose **Attach to Ribbon**.
 Current add-in features:
 
 - Detect current local Office document path when Office exposes it
-- Save the current document as a new OVC version
+- Save the current document as a new OVC version from its saved contents. The
+  operation stages and commits that document only, leaving other staged files
+  and edits available in the desktop app.
 - Show version history for the current document
 
 If Office cannot expose the local file path, paste the file path manually in the
 task pane.
+
+## Command line
+
+The Windows installer installs the desktop app and the `ovc` command together.
+After installation, open a new PowerShell or Command Prompt window:
+
+```powershell
+ovc --help
+ovc --workspace "D:\Documents" status
+ovc --workspace "D:\Documents" tracked-files
+ovc --workspace "D:\Documents" diff-working "Report.docx"
+```
+
+The installer adds the OVC `bin` directory to the machine PATH and removes
+that entry on uninstall. The command uses the same `.office-vcs/` workspace
+as the desktop app and runs without launching it.
+
+When developing from source, build or run the CLI target with Cargo:
+
+```bash
+cargo build --manifest-path src-tauri/Cargo.toml --release --bin ovc-cli
+cargo run --manifest-path src-tauri/Cargo.toml --bin ovc-cli -- --help
+```
+
+For a standalone build from source, the release executable is
+`src-tauri/target/release/ovc-cli` (`ovc-cli.exe` on Windows). Use the workspace
+directory containing `.office-vcs/` as `--workspace`.
+
+```bash
+ovc-cli --workspace "/path/to/workspace" status
+ovc-cli --workspace "/path/to/workspace" tracked-files
+ovc-cli --workspace "/path/to/workspace" log "/path/to/document.docx"
+ovc-cli --workspace "/path/to/workspace" diff-latest "/path/to/document.docx"
+```
+
+Use the `sourcePath` from `tracked-files` for version queries and the version
+IDs returned by `log` for `diff-versions` and `checkout`. The CLI also
+supports `init`, `track` and `commit`. Successful commands produce JSON on
+stdout. Errors go to stderr and return a nonzero exit code. Checkout
+overwrites an existing file at the supplied destination.
+
+`diff-working <file>` compares the saved file with its latest committed
+version, or with an empty baseline before its first commit.
+`stage <file>` captures a snapshot and `unstage <file>` removes it from the
+staging area. Use `diff-staged <file>` to review the snapshot and
+`commit-staged <message>` to commit the staging area. Use
+`diff-unstaged <file>` to review edits made since staging.
 
 ## Repository Data
 

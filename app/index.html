@@ -8,65 +8,115 @@
   </head>
   <body>
     <main class="shell">
-      <section class="toolbar">
-        <div>
+      <header class="toolbar">
+        <div class="workspace">
           <h1>OVC</h1>
           <p id="workspacePath">No workspace selected</p>
         </div>
-        <div class="actions">
-          <button id="selectWorkspaceBtn">Workspace</button>
-          <button id="initBtn">Init</button>
-          <button id="selectFilesBtn">Track files</button>
-        </div>
-      </section>
+        <details id="workspaceMenu" class="workspace-menu">
+          <summary>Workspace</summary>
+          <div class="workspace-actions">
+            <button id="selectWorkspaceBtn">Choose folder</button>
+            <button id="initBtn">Initialize repository</button>
+            <button id="selectFilesBtn">Add files</button>
+            <button id="aiSettingsBtn">AI API settings</button>
+          </div>
+        </details>
+      </header>
 
-      <section class="commit-row">
-        <input id="commitMessage" placeholder="Commit message" />
-        <button id="commitBtn">Commit</button>
-      </section>
-
-      <p id="messageLine" class="message">Ready.</p>
-
-      <section class="grid">
-        <div class="left-stack">
-          <div class="panel status-panel">
+      <div class="grid">
+        <aside class="file-sidebar" aria-label="Workspace files">
+          <section class="status-panel" aria-labelledby="changesHeading">
             <header>
-              <h2>Status</h2>
+              <h2 id="changesHeading">Changes</h2>
               <button id="statusBtn">Refresh</button>
             </header>
             <div id="statusOutput" class="status-list">Choose a workspace.</div>
+          </section>
+          <section class="status-panel" aria-labelledby="stagedHeading">
+            <header><h2 id="stagedHeading">Staged</h2></header>
+            <div id="stagedOutput" class="status-list">No staged files.</div>
+          </section>
+          <div class="commit-row">
+            <label for="commitMessage">Commit message</label>
+            <textarea id="commitMessage" rows="3" placeholder="Summarize your changes"></textarea>
+            <div class="commit-actions">
+              <button id="commitBtn" type="button" disabled>Commit</button>
+              <button id="generateMessageBtn" type="button" title="Generate a commit message with AI" disabled>AI draft</button>
+            </div>
           </div>
+        </aside>
 
-          <div class="panel history-panel">
-            <header>
-              <h2>History</h2>
-              <button id="logBtn">Refresh</button>
-            </header>
-            <div id="trackedFilesList" class="tracked-files">No tracked files.</div>
-            <div id="historyList" class="history">No history loaded.</div>
-          </div>
-        </div>
+        <section class="files-panel" aria-labelledby="filesHeading">
+          <header><h2 id="filesHeading">Tracked files</h2></header>
+          <div id="trackedFilesList" class="tracked-files">No tracked files.</div>
+        </section>
 
-        <div class="panel diff-panel">
+        <section class="history-panel" aria-labelledby="historyHeading">
           <header>
-            <h2>Diff</h2>
+            <h2 id="historyHeading">History</h2>
+            <button id="logBtn">Refresh</button>
+          </header>
+          <div id="historyList" class="history">Choose a tracked file to view versions.</div>
+        </section>
+
+        <section class="diff-panel" aria-labelledby="diffHeading">
+          <header>
+            <h2 id="diffHeading">Version diff</h2>
             <div class="diff-header-actions">
               <div class="diff-tabs" aria-label="Diff view">
                 <button id="diffTextTab" type="button" data-active="true">Text</button>
                 <button id="diffImagesTab" type="button" data-active="false">Images</button>
               </div>
-              <button id="diffBtn">Diff</button>
+              <button id="diffBtn">Compare</button>
             </div>
           </header>
-          <p id="diffFileLabel" class="diff-file">Choose a file in History.</p>
-          <div class="diff-controls">
-            <select id="fromVersionSelect" aria-label="From version"></select>
-            <select id="toVersionSelect" aria-label="To version"></select>
+          <p id="diffFileLabel" class="diff-file">Choose a tracked file.</p>
+          <div id="diffControls" class="diff-controls">
+            <label for="fromVersionSelect">From
+              <select id="fromVersionSelect"></select>
+            </label>
+            <label for="toVersionSelect">To
+              <select id="toVersionSelect"></select>
+            </label>
           </div>
-          <div id="diffOutput" class="diff-output">Choose a tracked file with at least two versions.</div>
-        </div>
-      </section>
+          <div id="diffOutput" class="diff-output"><p class="diff-empty">Choose a change or a tracked file.</p></div>
+        </section>
+      </div>
+
+      <p id="messageLine" class="message" role="status">Ready.</p>
     </main>
+
+    <dialog id="aiSettingsDialog" aria-labelledby="aiSettingsTitle">
+      <form id="aiSettingsForm" class="settings-form">
+        <h2 id="aiSettingsTitle">AI API settings</h2>
+        <label for="aiProvider">API format
+          <select id="aiProvider">
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+        </label>
+        <label for="aiBaseUrl">API URL
+          <input id="aiBaseUrl" type="url" spellcheck="false" required />
+        </label>
+        <label for="aiModel">Model name
+          <input id="aiModel" spellcheck="false" required />
+        </label>
+        <label for="aiApiKey">API key
+          <input id="aiApiKey" type="password" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="settings-checkbox" for="aiSupportsImages">
+          <input id="aiSupportsImages" type="checkbox" /> Model supports images
+        </label>
+        <p class="settings-note">Generation sends staged text and, when enabled, changed images to this API.</p>
+        <p class="settings-note">The API key is saved as plain text in <code id="aiSettingsPath"></code>.</p>
+        <p id="aiSettingsError" class="settings-error" role="alert" hidden></p>
+        <div class="settings-actions">
+          <button id="cancelAiSettingsBtn" type="button">Cancel</button>
+          <button id="saveAiSettingsBtn" type="submit">Save settings</button>
+        </div>
+      </form>
+    </dialog>
 
     <script type="module" src="./app.js"></script>
   </body>

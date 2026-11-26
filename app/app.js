@@ -10,7 +10,9 @@ const state = {
   historyFile: "",
   history: [],
   trackedFiles: [],
-  diffHistory: [],
+  diffMode: "versions",
+  selectionRequest: 0,
+  diffRequest: 0,
   latestDiff: null,
   activeDiffTab: "text",
   autoRefreshTimer: null,
@@ -19,17 +21,37 @@ const state = {
   watchUnlisten: null,
   statusRefreshRunning: false,
   statusRefreshPending: false,
-  committableChanges: 0
+  stagedCount: 0,
+  visibleChanges: new Map(),
+  stagedFingerprint: "",
+  generatingMessage: false,
+  repositoryBusy: false
 };
 
 const elements = {
   workspacePath: document.querySelector("#workspacePath"),
   messageLine: document.querySelector("#messageLine"),
+  workspaceMenu: document.querySelector("#workspaceMenu"),
+  stagedOutput: document.querySelector("#stagedOutput"),
   statusOutput: document.querySelector("#statusOutput"),
   commitMessage: document.querySelector("#commitMessage"),
   commitBtn: document.querySelector("#commitBtn"),
+  generateMessageBtn: document.querySelector("#generateMessageBtn"),
+  aiSettingsDialog: document.querySelector("#aiSettingsDialog"),
+  aiSettingsForm: document.querySelector("#aiSettingsForm"),
+  aiProvider: document.querySelector("#aiProvider"),
+  aiBaseUrl: document.querySelector("#aiBaseUrl"),
+  aiModel: document.querySelector("#aiModel"),
+  aiApiKey: document.querySelector("#aiApiKey"),
+  aiSupportsImages: document.querySelector("#aiSupportsImages"),
+  aiSettingsPath: document.querySelector("#aiSettingsPath"),
+  aiSettingsError: document.querySelector("#aiSettingsError"),
+  saveAiSettingsBtn: document.querySelector("#saveAiSettingsBtn"),
   historyList: document.querySelector("#historyList"),
   trackedFilesList: document.querySelector("#trackedFilesList"),
+  diffHeading: document.querySelector("#diffHeading"),
+  diffControls: document.querySelector("#diffControls"),
+  diffBtn: document.querySelector("#diffBtn"),
   diffFileLabel: document.querySelector("#diffFileLabel"),
   fromVersionSelect: document.querySelector("#fromVersionSelect"),
   toVersionSelect: document.querySelector("#toVersionSelect"),
@@ -46,6 +68,114 @@ updateCommitButtonState();
 
 elements.commitMessage.addEventListener("input", updateCommitButtonState);
 
+elements.workspaceMenu.addEventListener("click", (event) => {
+  if (event.target.closest("button")) elements.workspaceMenu.open = false;
+});
+
+document.addEventListener("click", (event) => {
+  if (!elements.workspaceMenu.contains(event.target)) elements.workspaceMenu.open = false;
+});
+
+elements.workspaceMenu.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !elements.workspaceMenu.open) return;
+  elements.workspaceMenu.open = false;
+  elements.workspaceMenu.querySelector("summary").focus();
+});
+
+const apiDefaults = {
+  openai: "https://api.openai.com/v1",
+  anthropic: "https://api.anthropic.com/v1"
+};
+
+document.querySelector("#aiSettingsBtn").addEventListener("click", () => run(async () => {
+  showAiSettings(await invoke("load_ai_settings"));
+}));
+
+document.querySelector("#cancelAiSettingsBtn").addEventListener("click", () => {
+  elements.aiSettingsDialog.close();
+});
+
+elements.aiSettingsDialog.addEventListener("close", () => {
+  elements.aiApiKey.value = "";
+});
+
+elements.aiProvider.addEventListener("change", () => {
+  if (!elements.aiBaseUrl.value || Object.values(apiDefaults).includes(elements.aiBaseUrl.value)) {
+    elements.aiBaseUrl.value = apiDefaults[elements.aiProvider.value];
+  }
+});
+
+elements.aiSettingsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (elements.saveAiSettingsBtn.disabled) return;
+  elements.saveAiSettingsBtn.disabled = true;
+  elements.aiSettingsError.hidden = true;
+  try {
+    await invoke("save_ai_settings", {
+      settings: {
+        provider: elements.aiProvider.value,
+        baseUrl: elements.aiBaseUrl.value.trim(),
+        model: elements.aiModel.value.trim(),
+        supportsImages: elements.aiSupportsImages.checked
+      },
+      apiKey: elements.aiApiKey.value.trim()
+    });
+    elements.aiSettingsDialog.close();
+    setMessage("AI API settings saved.");
+  } catch (error) {
+    elements.aiSettingsError.textContent = error?.message || String(error);
+    elements.aiSettingsError.hidden = false;
+  } finally {
+    elements.saveAiSettingsBtn.disabled = false;
+  }
+});
+
+elements.generateMessageBtn.addEventListener("click", () => run(generateCommitMessage));
+
+function showAiSettings({ settings, hasKey, path }) {
+  elements.aiProvider.value = settings.provider;
+  elements.aiBaseUrl.value = settings.baseUrl || apiDefaults[settings.provider];
+  elements.aiModel.value = settings.model;
+  elements.aiSupportsImages.checked = settings.supportsImages;
+  elements.aiApiKey.value = "";
+  elements.aiApiKey.placeholder = hasKey ? "Leave blank to keep the saved key" : "Enter API key";
+  elements.aiSettingsPath.textContent = path;
+  elements.aiSettingsError.hidden = true;
+  if (!elements.aiSettingsDialog.open) elements.aiSettingsDialog.showModal();
+}
+
+async function generateCommitMessage() {
+  if (elements.generateMessageBtn.disabled) return;
+  const workspace = state.workspace;
+  const staged = state.stagedFingerprint;
+  const draft = elements.commitMessage.value;
+  state.generatingMessage = true;
+  updateCommitButtonState();
+  try {
+    const settings = await invoke("load_ai_settings");
+    if (state.workspace !== workspace) return;
+    if (!settings.hasKey) {
+      showAiSettings(settings);
+      return;
+    }
+
+    const message = await invoke("generate_commit_message", { workspace });
+    if (state.workspace !== workspace || state.stagedFingerprint !== staged) {
+      setMessage("The staging area changed. Generate a new message for the current files.");
+      return;
+    }
+    if (elements.commitMessage.value !== draft) {
+      setMessage("Commit message changed while AI was generating.");
+      return;
+    }
+    elements.commitMessage.value = message;
+    setMessage("Commit message generated.");
+  } finally {
+    state.generatingMessage = false;
+    updateCommitButtonState();
+  }
+}
+
 document.querySelector("#selectWorkspaceBtn").addEventListener("click", async () => {
   await run(async () => {
     const workspace = await invoke("select_workspace");
@@ -54,15 +184,19 @@ document.querySelector("#selectWorkspaceBtn").addEventListener("click", async ()
     state.historyFile = "";
     state.history = [];
     state.trackedFiles = [];
-    state.diffHistory = [];
+    state.diffMode = "versions";
+    state.selectionRequest += 1;
     state.latestDiff = null;
-    state.committableChanges = 0;
+    state.stagedCount = 0;
+    state.visibleChanges.clear();
+    state.stagedFingerprint = "";
     updateCommitButtonState();
     elements.workspacePath.textContent = workspace;
-    elements.diffFileLabel.textContent = "Choose a file in History.";
+    elements.diffFileLabel.textContent = "Choose a tracked file.";
     renderTrackedFiles();
     renderHistory();
-    renderDiffVersionOptions();
+    renderStatus({});
+    renderDiffControls();
     localStorage.setItem("ovc.workspace", workspace);
     await startWorkspaceWatch();
     await refreshStatus();
@@ -85,12 +219,16 @@ document.querySelector("#initBtn").addEventListener("click", async () => {
 document.querySelector("#selectFilesBtn").addEventListener("click", async () => {
   await run(async () => {
     requireWorkspace();
+    const workspace = state.workspace;
     const files = await invoke("select_office_files");
-    if (!files.length) return;
-    const staged = await invoke("track_files", { workspace: state.workspace, files });
-    await refreshStatus();
-    await refreshTrackedFiles();
-    setMessage(`Tracking ${staged.length} new file(s).`);
+    if (!files.length || state.workspace !== workspace) return;
+    await mutateRepository(async () => {
+      const staged = await invoke("track_files", { workspace, files });
+      if (state.workspace !== workspace) return;
+      await refreshStatus();
+      await refreshTrackedFiles();
+      setMessage(`Added and staged ${staged.length} file(s).`);
+    });
   });
 });
 
@@ -99,7 +237,7 @@ document.querySelector("#logBtn").addEventListener("click", async () => {
   await run(async () => {
     await refreshTrackedFiles();
     if (state.historyFile) {
-      await selectTrackedFile(state.historyFile, false);
+      await selectTrackedFile(state.historyFile, false, state.diffMode);
     }
     setMessage("History refreshed.");
   });
@@ -107,12 +245,14 @@ document.querySelector("#logBtn").addEventListener("click", async () => {
 
 elements.diffTextTab.addEventListener("click", () => {
   state.activeDiffTab = "text";
-  renderDiff(state.latestDiff);
+  setDiffTabState();
+  if (state.latestDiff) renderDiff(state.latestDiff);
 });
 
 elements.diffImagesTab.addEventListener("click", () => {
   state.activeDiffTab = "images";
-  renderDiff(state.latestDiff);
+  setDiffTabState();
+  if (state.latestDiff) renderDiff(state.latestDiff);
 });
 
 document.querySelector("#commitBtn").addEventListener("click", async () => {
@@ -121,30 +261,41 @@ document.querySelector("#commitBtn").addEventListener("click", async () => {
     requireWorkspace();
     const message = elements.commitMessage.value.trim();
     if (!message) throw new Error("Commit message is required.");
-    const records = await invoke("commit_detected", { workspace: state.workspace, message });
-    elements.commitMessage.value = "";
-    await refreshStatus();
-    await refreshTrackedFiles();
-    if (state.historyFile) await selectTrackedFile(state.historyFile, false);
-    setMessage(`Committed ${records.length} detected change(s).`);
+    const workspace = state.workspace;
+    await mutateRepository(async () => {
+      const records = await invoke("commit_staged", { workspace, message });
+      if (state.workspace !== workspace) return;
+      elements.commitMessage.value = "";
+      await refreshStatus();
+      await refreshTrackedFiles();
+      if (state.historyFile) await selectTrackedFile(state.historyFile, false);
+      setMessage(records.length ? `Committed ${records.length} file(s).` : "The staged files already match their latest versions.");
+    });
   });
 });
 
-document.querySelector("#diffBtn").addEventListener("click", async () => {
+elements.diffBtn.addEventListener("click", async () => {
   await run(async () => {
     requireWorkspace();
     const filePath = state.historyFile;
-    if (!filePath) throw new Error("Choose a file in History before diffing.");
+    if (!filePath) throw new Error("Choose a tracked file before comparing versions.");
+    if (state.diffMode !== "versions") {
+      await selectTrackedFile(filePath, false, state.diffMode);
+      return;
+    }
     const fromVersion = elements.fromVersionSelect.value;
     const toVersion = elements.toVersionSelect.value;
     if (!fromVersion || !toVersion) throw new Error("Choose two versions before diffing.");
     if (fromVersion === toVersion) throw new Error("Choose two different versions.");
+    const request = ++state.diffRequest;
+    const selection = state.selectionRequest;
     const diff = await invoke("diff_versions", {
       workspace: state.workspace,
       filePath,
       fromVersion,
       toVersion
     });
+    if (request !== state.diffRequest || selection !== state.selectionRequest) return;
     state.latestDiff = diff;
     renderDiff(diff);
     setMessage("Diff loaded.");
@@ -182,9 +333,15 @@ async function refreshStatus() {
   state.statusRefreshRunning = true;
   state.statusRefreshPending = false;
   try {
-    const status = await invoke("status", { workspace: state.workspace });
-    state.committableChanges = (status.staged || []).length + (status.modified || []).length;
-    renderStatus(status);
+    const workspace = state.workspace;
+    const status = await invoke("status", { workspace });
+    if (state.workspace !== workspace) return;
+    const modified = await filterVisibleChanges(workspace, status);
+    if (state.workspace !== workspace) return;
+    const staged = status.staged || [];
+    state.stagedCount = staged.length;
+    state.stagedFingerprint = JSON.stringify(staged.map((file) => [file.sourcePath, file.hash]).sort());
+    renderStatus({ ...status, modified });
     updateCommitButtonState();
   } finally {
     state.statusRefreshRunning = false;
@@ -195,80 +352,179 @@ async function refreshStatus() {
   }
 }
 
-function renderStatus(status) {
-  const modified = status.modified || [];
-  elements.statusOutput.textContent = "";
+async function filterVisibleChanges(workspace, status) {
+  const staged = new Map((status.staged || []).map((file) => [file.sourcePath, file]));
+  const cache = new Map();
+  const visible = [];
+  for (const file of status.modified || []) {
+    if (state.workspace !== workspace) break;
+    const snapshot = staged.get(file.sourcePath);
+    if (snapshot?.hash === file.currentHash) continue;
+    const baseHash = snapshot?.snapshot ? snapshot.hash : file.previousHash;
+    if (!baseHash) {
+      visible.push(file);
+      continue;
+    }
+    const key = JSON.stringify([file.sourcePath, baseHash, file.currentHash]);
+    let changed = state.visibleChanges.get(key);
+    if (changed === undefined) {
+      try {
+        changed = await invoke("has_visible_change", {
+          workspace, filePath: file.sourcePath, baseHash, currentHash: file.currentHash
+        });
+      } catch {
+        // Keep files visible if Office is still saving or the package cannot be read.
+        visible.push(file);
+        continue;
+      }
+    }
+    if (changed === null) continue;
+    cache.set(key, changed);
+    if (changed) visible.push(file);
+  }
+  if (state.workspace === workspace) state.visibleChanges = cache;
+  return visible;
+}
 
-  if (!modified.length) {
+function renderStatus(status) {
+  const staged = new Map((status.staged || []).map((item) => [item.sourcePath, item]));
+  renderChangeList(elements.statusOutput, status.modified || [], "working", "No unstaged changes.");
+  renderChangeList(elements.stagedOutput, [...staged.values()], "staged", "No staged files.");
+}
+
+function renderChangeList(container, files, mode, emptyMessage) {
+  container.textContent = "";
+  if (!files.length) {
     const empty = document.createElement("div");
     empty.className = "status-empty";
-    empty.textContent = "No modified tracked files.";
-    elements.statusOutput.append(empty);
+    empty.textContent = emptyMessage;
+    container.append(empty);
     return;
   }
 
-  for (const item of modified) {
-    const button = document.createElement("button");
-    button.className = "status-item";
-    button.type = "button";
-    button.addEventListener("click", () => run(() => selectTrackedFile(item.sourcePath)));
+  const staged = mode === "staged";
+  for (const item of [...files].sort((a, b) => a.sourcePath.localeCompare(b.sourcePath))) {
+    const row = document.createElement("div");
+    row.className = "change-row";
+
+    const preview = document.createElement("button");
+    preview.className = "status-item";
+    preview.type = "button";
+    preview.title = item.sourcePath;
+    preview.addEventListener("click", () => run(() => selectTrackedFile(item.sourcePath, true, mode)));
 
     const title = document.createElement("strong");
     title.textContent = displayPath(item.sourcePath);
-
     const meta = document.createElement("small");
-    meta.textContent = `${shortHash(item.previousHash)} -> ${shortHash(item.currentHash)}`;
+    meta.textContent = staged ? shortHash(item.hash) : shortHash(item.currentHash);
+    preview.append(title, meta);
 
-    button.append(title, meta);
-    elements.statusOutput.append(button);
+    const action = document.createElement("button");
+    action.className = "stage-action";
+    action.type = "button";
+    action.textContent = staged ? "Unstage" : "Stage";
+    action.setAttribute("aria-label", `${action.textContent} ${item.sourcePath}`);
+    action.addEventListener("click", () => run(() => updateStage(item.sourcePath, !staged)));
+
+    row.append(preview, action);
+    container.append(row);
   }
+}
+
+async function mutateRepository(task) {
+  if (state.repositoryBusy) return;
+  state.repositoryBusy = true;
+  updateCommitButtonState();
+  try {
+    await task();
+  } finally {
+    state.repositoryBusy = false;
+    updateCommitButtonState();
+  }
+}
+
+async function updateStage(filePath, stage) {
+  await mutateRepository(async () => {
+    const workspace = state.workspace;
+    const selection = state.selectionRequest;
+    await invoke(stage ? "stage_file" : "unstage_file", { workspace, filePath });
+    if (state.workspace !== workspace) return;
+    await refreshStatus();
+    await refreshTrackedFiles();
+    if (selection === state.selectionRequest && state.historyFile === filePath) {
+      await selectTrackedFile(filePath, false, stage ? "staged" : "working");
+    }
+    setMessage(`${stage ? "Staged" : "Unstaged"} ${displayPath(filePath)}.`);
+  });
 }
 
 async function refreshTrackedFiles() {
   requireWorkspace();
-  state.trackedFiles = await invoke("tracked_files", { workspace: state.workspace });
+  const workspace = state.workspace;
+  const trackedFiles = await invoke("tracked_files", { workspace });
+  if (state.workspace !== workspace) return;
+  state.trackedFiles = trackedFiles;
   renderTrackedFiles();
   if (state.historyFile && !state.trackedFiles.some((file) => file.sourcePath === state.historyFile)) {
     state.historyFile = "";
     state.history = [];
-    state.diffHistory = [];
+    state.diffMode = "versions";
+    state.selectionRequest += 1;
     state.latestDiff = null;
-    elements.diffFileLabel.textContent = "Choose a file in History.";
+    elements.diffFileLabel.textContent = "Choose a tracked file.";
     renderHistory();
-    renderDiffVersionOptions();
+    renderDiffControls();
   }
 }
 
-async function refreshLog() {
+async function selectTrackedFile(filePath, announce = true, mode = "versions") {
   requireWorkspace();
-  const filePath = state.historyFile;
-  if (!filePath) throw new Error("Choose a file for history.");
-  state.history = await invoke("log", { workspace: state.workspace, filePath });
-  renderHistory();
-}
-
-async function refreshDiffVersions() {
-  requireWorkspace();
-  const filePath = state.historyFile;
-  if (!filePath) throw new Error("Choose a file for diff.");
-  state.diffHistory = await invoke("log", { workspace: state.workspace, filePath });
-  renderDiffVersionOptions();
-  if (state.diffHistory.length < 2) {
-    renderDiffMessage("At least two versions are required to diff this file.");
-  } else {
-    renderDiffMessage("Choose versions, then click Diff.");
-  }
-}
-
-async function selectTrackedFile(sourcePath, announce = true) {
-  state.historyFile = sourcePath;
+  const workspace = state.workspace;
+  const selection = ++state.selectionRequest;
+  const label = displayPath(filePath);
+  state.historyFile = filePath;
+  state.diffMode = mode;
+  state.history = [];
   state.latestDiff = null;
-  const label = displayPath(sourcePath);
   elements.diffFileLabel.textContent = label;
   renderTrackedFiles();
-  await refreshLog();
-  await refreshDiffVersions();
-  if (announce) setMessage(`Loaded ${label}.`);
+  elements.historyList.textContent = "Loading history…";
+  renderDiffControls();
+
+  try {
+    const records = await invoke("log", { workspace, filePath });
+    if (selection !== state.selectionRequest) return;
+    state.history = records;
+    renderHistory();
+    if (mode !== "versions") {
+      const command = mode === "staged" ? "diff_staged" : "diff_working";
+      const diff = await invoke(command, { workspace, filePath });
+      if (selection !== state.selectionRequest) return;
+      state.latestDiff = diff;
+      renderDiff(diff);
+    } else {
+      renderDiffControls();
+    }
+    if (announce) setMessage(`Loaded ${label}.`);
+  } catch (error) {
+    if (selection !== state.selectionRequest) return;
+    renderHistory();
+    renderDiffMessage("Could not load the comparison.");
+    throw error;
+  }
+}
+
+function renderDiffControls() {
+  const comparingVersions = state.diffMode === "versions";
+  const headings = { working: "Working copy diff", staged: "Staged diff", versions: "Version diff" };
+  elements.diffHeading.textContent = headings[state.diffMode];
+  elements.diffControls.hidden = !comparingVersions;
+  elements.diffBtn.textContent = comparingVersions ? "Compare" : "Refresh diff";
+  if (comparingVersions) {
+    renderDiffVersionOptions();
+  } else {
+    renderDiffMessage("Loading comparison…");
+  }
 }
 
 function renderTrackedFiles() {
@@ -344,16 +600,16 @@ function renderDiffVersionOptions() {
   elements.fromVersionSelect.textContent = "";
   elements.toVersionSelect.textContent = "";
 
-  if (!state.diffHistory.length) {
+  if (!state.history.length) {
     elements.fromVersionSelect.append(new Option("From", ""));
     elements.toVersionSelect.append(new Option("To", ""));
     renderDiffMessage(state.historyFile
       ? "At least two versions are required to diff this file."
-      : "Choose a tracked file with at least two versions.");
+      : "Choose a change or a tracked file.");
     return;
   }
 
-  const records = [...state.diffHistory].sort((a, b) => versionNumber(a.id) - versionNumber(b.id));
+  const records = [...state.history].sort((a, b) => versionNumber(a.id) - versionNumber(b.id));
   for (const record of records) {
     const label = `${record.id} - ${record.message || "No message"}`;
     elements.fromVersionSelect.append(new Option(label, record.id));
@@ -364,17 +620,12 @@ function renderDiffVersionOptions() {
     elements.fromVersionSelect.value = records[records.length - 2].id;
     elements.toVersionSelect.value = records[records.length - 1].id;
   }
+  renderDiffMessage(records.length < 2
+    ? "At least two versions are required to diff this file."
+    : "Choose versions, then click Compare.");
 }
 
 function renderDiff(diff) {
-  setDiffTabState();
-  if (!diff) {
-    renderDiffMessage(state.historyFile
-      ? "Choose versions, then click Diff."
-      : "Choose a tracked file with at least two versions.");
-    return;
-  }
-
   if (state.activeDiffTab === "images") {
     renderImageDiff(diff);
   } else {
@@ -415,7 +666,18 @@ function renderTextDiff(diff) {
   if (!diff.lines.length || (!diff.addedLines && !diff.removedLines)) {
     const empty = document.createElement("div");
     empty.className = "diff-empty";
-    empty.textContent = "No text changes detected between these versions.";
+    empty.textContent = diff.packageChanges?.length
+      ? "Text and images match. These Office package parts changed:"
+      : "No text changes detected between these versions.";
+    if (diff.packageChanges?.length) {
+      const parts = document.createElement("ul");
+      for (const change of diff.packageChanges) {
+        const part = document.createElement("li");
+        part.textContent = change;
+        parts.append(part);
+      }
+      empty.append(parts);
+    }
     list.append(empty);
   } else {
     for (const line of diff.lines) {
@@ -670,11 +932,14 @@ function startFallbackRefresh() {
 
 function updateCommitButtonState() {
   const hasMessage = elements.commitMessage.value.trim().length > 0;
-  const canCommit = Boolean(state.workspace) && state.committableChanges > 0 && hasMessage;
+  const canCommit = Boolean(state.workspace) && state.stagedCount > 0 && hasMessage && !state.repositoryBusy;
   elements.commitBtn.disabled = !canCommit;
+  elements.generateMessageBtn.disabled = !state.workspace || state.stagedCount === 0
+    || state.repositoryBusy || state.generatingMessage;
+  elements.generateMessageBtn.textContent = state.generatingMessage ? "Generating…" : "AI draft";
   elements.commitBtn.title = canCommit
-    ? "Commit detected changes"
-    : "Enter a commit message after tracked files change.";
+    ? "Commit staged files"
+    : "Stage files and enter a commit message.";
 }
 
 function requireWorkspace() {

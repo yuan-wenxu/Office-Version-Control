@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai;
 mod api;
 mod certs;
 mod core;
@@ -73,7 +74,7 @@ fn track_files(workspace: String, files: Vec<String>) -> Result<Vec<core::Staged
     let manager = manager(workspace);
     files
         .iter()
-        .map(|file| manager.add(file))
+        .map(|file| manager.stage(file))
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_error)
 }
@@ -91,6 +92,21 @@ fn commit_detected(workspace: String, message: String) -> Result<Vec<VersionReco
 }
 
 #[tauri::command]
+fn stage_file(workspace: String, file_path: String) -> Result<(), String> {
+    manager(workspace).stage(&file_path).map(|_| ()).map_err(to_error)
+}
+
+#[tauri::command]
+fn unstage_file(workspace: String, file_path: String) -> Result<(), String> {
+    manager(workspace).unstage(&file_path).map_err(to_error)
+}
+
+#[tauri::command]
+fn commit_staged(workspace: String, message: String) -> Result<Vec<VersionRecord>, String> {
+    manager(workspace).commit_staged(message).map_err(to_error)
+}
+
+#[tauri::command]
 fn log(workspace: String, file_path: Option<String>) -> Result<Vec<VersionRecord>, String> {
     manager(workspace)
         .log(file_path.as_deref())
@@ -105,6 +121,40 @@ fn tracked_files(workspace: String) -> Result<Vec<TrackedFile>, String> {
 #[tauri::command]
 fn diff_latest(workspace: String, file_path: String) -> Result<DiffResult, String> {
     manager(workspace).diff_latest(&file_path).map_err(to_error)
+}
+
+#[tauri::command]
+async fn has_visible_change(
+    workspace: String,
+    file_path: String,
+    base_hash: String,
+    current_hash: String,
+) -> Result<Option<bool>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        manager(workspace)
+            .has_visible_change(&file_path, &base_hash, &current_hash)
+            .map_err(to_error)
+    })
+    .await
+    .map_err(to_error)?
+}
+
+#[tauri::command]
+async fn diff_working(workspace: String, file_path: String) -> Result<DiffResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        manager(workspace).diff_unstaged(&file_path).map_err(to_error)
+    })
+    .await
+    .map_err(to_error)?
+}
+
+#[tauri::command]
+async fn diff_staged(workspace: String, file_path: String) -> Result<DiffResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        manager(workspace).diff_staged(&file_path).map_err(to_error)
+    })
+    .await
+    .map_err(to_error)?
 }
 
 #[tauri::command]
@@ -203,6 +253,9 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            ai::load_ai_settings,
+            ai::save_ai_settings,
+            ai::generate_commit_message,
             select_workspace,
             select_office_files,
             select_office_file,
@@ -210,9 +263,15 @@ fn main() {
             init_repo,
             track_files,
             status,
+            stage_file,
+            unstage_file,
+            commit_staged,
             commit_detected,
             log,
             tracked_files,
+            diff_working,
+            has_visible_change,
+            diff_staged,
             diff_latest,
             diff_versions,
             checkout_version,

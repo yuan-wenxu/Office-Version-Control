@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -14,8 +14,12 @@ use similar::{ChangeTag, TextDiff};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
-use crate::office::{detect_office_kind, extract_office_text, is_supported_office_file};
+use crate::office::{
+    detect_office_kind, equivalent_package_xml, extract_docx_parts, extract_package_text, extract_pptx_parts,
+    is_supported_office_file,
+};
 
+type ImageEntries = BTreeMap<String, (String, Option<u64>)>;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +31,8 @@ pub struct StagedRecord {
     pub hash: String,
     pub staged_at: String,
     pub size: u64,
+    #[serde(default)]
+    pub snapshot: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +91,17 @@ pub struct DiffVersionInfo {
     pub hash: String,
 }
 
+impl From<&VersionRecord> for DiffVersionInfo {
+    fn from(record: &VersionRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            message: record.message.clone(),
+            created_at: record.created_at.clone(),
+            hash: record.hash.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffLine {
@@ -122,6 +139,8 @@ pub struct DiffResult {
     pub modified_images: usize,
     pub unchanged_images: usize,
     pub images: Vec<DiffImage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_changes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +149,8 @@ struct RepositoryMetadata {
     schema_version: u8,
     files: HashMap<String, Vec<VersionRecord>>,
     staged: HashMap<String, StagedRecord>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pending: HashMap<String, StagedRecord>,
 }
 
 impl Default for RepositoryMetadata {
@@ -138,6 +159,7 @@ impl Default for RepositoryMetadata {
             schema_version: 1,
             files: HashMap::new(),
             staged: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 }
@@ -201,14 +223,83 @@ impl VersionManager {
             hash,
             staged_at: now()?,
             size: stat.len(),
+            snapshot: false,
         };
 
         let mut metadata = self.read_metadata()?;
-        metadata
-            .staged
-            .insert(record.source_path.clone(), record.clone());
+        metadata.pending.remove(&record.source_path);
+        metadata.staged.insert(record.source_path.clone(), record.clone());
         self.write_metadata(&metadata)?;
         Ok(record)
+    }
+
+    pub fn stage(&self, file_path: &str) -> Result<StagedRecord> {
+        let (mut staged, bytes) = self.read_working_file(file_path)?;
+        self.store_snapshot(&staged, bytes)?;
+        staged.snapshot = true;
+        let mut metadata = self.read_metadata()?;
+        metadata.pending.remove(&staged.source_path);
+        metadata.staged.insert(staged.source_path.clone(), staged.clone());
+        self.write_metadata(&metadata)?;
+        Ok(staged)
+    }
+
+    pub fn unstage(&self, file_path: &str) -> Result<()> {
+        let key = self.source_key_for_input(file_path)?;
+        let mut metadata = self.read_metadata()?;
+        if let Some(staged) = metadata.staged.remove(&key) {
+            if !metadata.files.contains_key(&key) {
+                metadata.pending.insert(key, staged);
+            }
+            self.write_metadata(&metadata)?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "The Office plug-in uses this operation through the local API.")]
+    pub fn commit_file(&self, file_path: &str, message: &str) -> Result<Option<VersionRecord>> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("Commit message is required.".into());
+        }
+        let (snapshot, bytes) = self.read_working_file(file_path)?;
+        self.store_snapshot(&snapshot, bytes)?;
+        let mut metadata = self.read_metadata()?;
+        let Some(record) = self.record_version(&mut metadata, &snapshot, message)? else {
+            return Ok(None);
+        };
+        metadata.staged.remove(&snapshot.source_path);
+        self.write_metadata(&metadata)?;
+        Ok(Some(record))
+    }
+
+    pub fn commit_staged(&self, message: String) -> Result<Vec<VersionRecord>> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("Commit message is required.".into());
+        }
+        let mut metadata = self.read_metadata()?;
+        if metadata.staged.is_empty() {
+            return Err("Stage a file before committing.".into());
+        }
+
+        let mut staged = metadata.staged.values().cloned().collect::<Vec<_>>();
+        staged.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+        let mut committed = Vec::new();
+        for mut item in staged {
+            if !item.snapshot {
+                // Entries created by earlier versions only recorded a file path.
+                let (current, bytes) = self.read_working_file(&item.source_path)?;
+                self.store_snapshot(&current, bytes)?;
+                item = current;
+            }
+            if let Some(version) = self.record_version(&mut metadata, &item, message)? {
+                committed.push(version);
+            }
+        }
+        metadata.staged.clear();
+        self.write_metadata(&metadata)?;
+        Ok(committed)
     }
 
     pub fn commit_tracked_changes(&self, message: String) -> Result<Vec<VersionRecord>> {
@@ -257,12 +348,13 @@ impl VersionManager {
                 continue;
             };
             let path = self.resolve_source_path(source_path);
-            if !path.exists() {
+            let Some(current_hash) = working_hash(&path)? else {
                 missing.push(latest.clone());
                 continue;
-            }
-            let current_hash = sha256_file(&path)?;
-            if current_hash != latest.hash {
+            };
+            if current_hash != latest.hash || metadata.staged.get(source_path)
+                .is_some_and(|staged| staged.snapshot && staged.hash != current_hash)
+            {
                 modified.push(ModifiedRecord {
                     source_path: source_path.clone(),
                     original_name: latest.original_name.clone(),
@@ -272,6 +364,32 @@ impl VersionManager {
             }
         }
 
+        for staged in metadata.staged.values().filter(|staged| {
+            staged.snapshot && !metadata.files.contains_key(&staged.source_path)
+        }) {
+            let path = self.resolve_source_path(&staged.source_path);
+            if let Some(current_hash) = working_hash(&path)? {
+                if current_hash != staged.hash {
+                    modified.push(ModifiedRecord {
+                        source_path: staged.source_path.clone(),
+                        original_name: staged.original_name.clone(),
+                        previous_hash: staged.hash.clone(),
+                        current_hash,
+                    });
+                }
+            }
+        }
+        for pending in metadata.pending.values() {
+            let path = self.resolve_source_path(&pending.source_path);
+            if let Some(current_hash) = working_hash(&path)? {
+                modified.push(ModifiedRecord {
+                    source_path: pending.source_path.clone(),
+                    original_name: pending.original_name.clone(),
+                    previous_hash: String::new(),
+                    current_hash,
+                });
+            }
+        }
         Ok(RepositoryStatus {
             staged: metadata.staged.values().cloned().collect(),
             modified,
@@ -316,22 +434,202 @@ impl VersionManager {
             );
         }
 
-        for (source_path, staged) in &metadata.staged {
-            files
-                .entry(source_path.clone())
-                .or_insert_with(|| TrackedFile {
+        for (is_staged, entries) in [(true, &metadata.staged), (false, &metadata.pending)] {
+            for (source_path, item) in entries {
+                files.entry(source_path.clone()).or_insert_with(|| TrackedFile {
                     source_path: source_path.clone(),
-                    original_name: staged.original_name.clone(),
-                    kind: staged.kind.clone(),
+                    original_name: item.original_name.clone(),
+                    kind: item.kind.clone(),
                     versions: 0,
-                    latest_hash: staged.hash.clone(),
-                    latest_created_at: staged.staged_at.clone(),
-                    size: staged.size,
-                    staged: true,
+                    latest_hash: item.hash.clone(),
+                    latest_created_at: item.staged_at.clone(),
+                    size: item.size,
+                    staged: is_staged,
                 });
+            }
         }
 
         Ok(files.into_values().collect())
+    }
+
+    pub fn diff_staged(&self, file_path: &str) -> Result<DiffResult> {
+        let key = self.source_key_for_input(file_path)?;
+        let metadata = self.read_metadata()?;
+        let staged = metadata.staged.get(&key).ok_or("File is not staged.")?;
+        if !staged.snapshot {
+            return self.diff_working(file_path);
+        }
+        let to = self.snapshot_record(staged, "Staged".into(), "Staged changes")?;
+        let from = metadata.files.get(&key).and_then(|versions| versions.last());
+        self.diff_records(from, &to, true)
+    }
+
+    #[allow(dead_code, reason = "The desktop AI workflow uses this method; the CLI does not.")]
+    pub fn staged_diffs(&self, previews: bool, limit: usize) -> Result<(usize, Vec<(String, DiffResult)>)> {
+        let metadata = self.read_metadata()?;
+        let mut staged = metadata.staged.values().collect::<Vec<_>>();
+        staged.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+        if staged.is_empty() {
+            return Err("Stage files before generating a commit message.".into());
+        }
+        let count = staged.len();
+        let mut diffs = Vec::new();
+        for entry in staged.into_iter().take(limit) {
+            if !entry.snapshot {
+                return Err(format!("Unstage and stage {} again to capture its contents.", entry.source_path).into());
+            }
+            let to = self.snapshot_record(entry, "Staged".into(), "Staged changes")?;
+            let from = metadata.files.get(&entry.source_path).and_then(|versions| versions.last());
+            diffs.push((entry.source_path.clone(), self.diff_records(from, &to, previews)?));
+        }
+        Ok((count, diffs))
+    }
+
+    pub fn diff_working(&self, file_path: &str) -> Result<DiffResult> {
+        self.diff_working_copy(file_path, false)
+    }
+
+    pub fn diff_unstaged(&self, file_path: &str) -> Result<DiffResult> {
+        self.diff_working_copy(file_path, true)
+    }
+
+    #[allow(dead_code, reason = "Used by the desktop change list.")]
+    pub fn has_visible_change(
+        &self,
+        file_path: &str,
+        base_hash: &str,
+        current_hash: &str,
+    ) -> Result<Option<bool>> {
+        let metadata = self.read_metadata()?;
+        let base = metadata.staged.get(file_path)
+            .filter(|item| item.snapshot)
+            .map(|item| (item.hash.as_str(), self.snapshot_paths(&item.hash).0))
+            .or_else(|| {
+                let latest = metadata.files.get(file_path)?.last()?;
+                Some((latest.hash.as_str(), self.resolve_stored_path(&latest.manifest_path)))
+            });
+        let Some((hash, manifest_path)) = base else { return Ok(None) };
+        if hash != base_hash {
+            return Ok(None);
+        }
+
+        let bytes = match fs::read(self.resolve_source_path(file_path)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if sha256_bytes(&bytes) != current_hash {
+            return Ok(None);
+        }
+
+        let manifest: PackageManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
+        let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+        Ok(Some(!self.working_package_changes(&manifest, &mut archive, 1)?.is_empty()))
+    }
+
+    fn working_package_changes(
+        &self,
+        manifest: &PackageManifest,
+        archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let mut entries = manifest.entries.iter().filter(|entry| {
+            !entry.dir && !is_save_metadata(&entry.name)
+        }).map(|entry| (entry.name.as_str(), entry)).collect::<BTreeMap<_, _>>();
+        let mut changes = Vec::new();
+
+        for index in 0..archive.len() {
+            let mut current = archive.by_index(index)?;
+            let name = current.name().to_string();
+            if current.is_dir() || is_save_metadata(&name) {
+                continue;
+            }
+            if let Some(old) = entries.remove(name.as_str()) {
+                let hash = old.hash.as_deref().ok_or("Missing package entry hash")?;
+                let mut data = Vec::new();
+                current.read_to_end(&mut data)?;
+                if sha256_bytes(&data) == hash {
+                    continue;
+                }
+                if name.ends_with(".xml") || name.ends_with(".rels") {
+                    let previous = if old.compressed {
+                        read_blob_data(&self.blobs(), hash)?
+                    } else {
+                        fs::read(blob_path(&self.blobs(), hash))?
+                    };
+                    if equivalent_package_xml(&name, &previous, &data) {
+                        continue;
+                    }
+                }
+                changes.push(format!("Modified: {name}"));
+            } else {
+                changes.push(format!("Added: {name}"));
+            }
+            if changes.len() == limit {
+                return Ok(changes);
+            }
+        }
+        let remaining = limit - changes.len();
+        changes.extend(entries.keys().take(remaining).map(|name| format!("Removed: {name}")));
+        Ok(changes)
+    }
+
+    fn diff_working_copy(
+        &self,
+        file_path: &str,
+        use_staged_base: bool,
+    ) -> Result<DiffResult> {
+        let path = self.resolve_source_path(file_path);
+        let key = self.source_key(&path)?;
+        let kind = detect_office_kind(&path)?;
+        let metadata = self.read_metadata()?;
+        let latest = metadata.files.get(&key).and_then(|records| records.last());
+        let staged = metadata.staged.get(&key);
+        if latest.is_none() && staged.is_none() && !metadata.pending.contains_key(&key) {
+            return Err("File is not tracked in this workspace.".into());
+        }
+        let staged_base = staged.filter(|entry| use_staged_base && entry.snapshot)
+            .map(|entry| self.snapshot_record(entry, "Staged".into(), "Staged changes"))
+            .transpose()?;
+        let baseline = staged_base.as_ref().or(latest);
+        let (from, old_text, old_images) = self.diff_base(baseline)?;
+
+        let bytes = fs::read(&path)?;
+        let to = DiffVersionInfo {
+            id: "Working copy".into(),
+            message: "Uncommitted changes".into(),
+            created_at: String::new(),
+            hash: sha256_bytes(&bytes),
+        };
+        let mut zip = ZipArchive::new(Cursor::new(bytes))?;
+        let new_text = extract_package_text(kind, &mut zip)?;
+        let mut new_images = BTreeMap::new();
+        for index in 0..zip.len() {
+            let mut entry = zip.by_index(index)?;
+            if !entry.is_dir() && is_office_image_entry(entry.name()) {
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data)?;
+                new_images.insert(
+                    entry.name().to_string(),
+                    (sha256_bytes(&data), Some(entry.size())),
+                );
+            }
+        }
+        let images = self.diff_images(&old_images, &new_images, true, |name, hash| {
+            let mut data = Vec::new();
+            zip.by_name(name).ok()?.read_to_end(&mut data).ok()?;
+            let mime = image_mime(name)?;
+            (sha256_bytes(&data) == hash).then(|| format!("data:{mime};base64,{}", BASE64.encode(data)))
+        });
+
+        let mut result = Self::build_diff(from, to, &old_text, &new_text, images);
+        if result.added_lines == 0 && result.removed_lines == 0 && result.images.is_empty() {
+            if let Some(base) = baseline.filter(|base| base.hash != result.to.hash) {
+                let manifest = self.read_manifest(base)?;
+                result.package_changes = self.working_package_changes(&manifest, &mut zip, 12)?;
+            }
+        }
+        Ok(result)
     }
 
     pub fn diff_latest(&self, file_path: &str) -> Result<DiffResult> {
@@ -342,7 +640,7 @@ impl VersionManager {
 
         let from = &records[records.len() - 2];
         let to = &records[records.len() - 1];
-        self.diff_records(from, to)
+        self.diff_records(Some(from), to, true)
     }
 
     pub fn diff_versions(&self, file_path: &str, from_id: &str, to_id: &str) -> Result<DiffResult> {
@@ -355,7 +653,7 @@ impl VersionManager {
             .iter()
             .find(|item| item.id == to_id)
             .ok_or_else(|| format!("Version not found: {to_id}"))?;
-        self.diff_records(from, to)
+        self.diff_records(Some(from), to, true)
     }
 
     pub fn checkout(&self, file_path: &str, version: &str, output: &str) -> Result<PathBuf> {
@@ -373,50 +671,88 @@ impl VersionManager {
         Ok(output)
     }
 
-    fn save_version(&self, file_path: &str, message: &str) -> Result<VersionRecord> {
+    fn read_working_file(&self, file_path: &str) -> Result<(StagedRecord, Vec<u8>)> {
         let path = normalize_existing_path(&self.resolve_source_path(file_path))?;
-        let stat = validate_office_file(&path)?;
-        let hash = sha256_file(&path)?;
-        let source_path = self.source_key(&path)?;
-
-        let metadata = self.read_metadata()?;
-        let existing = metadata
-            .files
-            .get(&source_path)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(previous) = existing.last().filter(|item| item.hash == hash) {
-            return Ok(previous.clone());
-        }
-
-        let manifest_path = save_office_package(&path, &hash, &self.blobs(), &self.packages())?;
-        let text = extract_office_text(&path)?;
-        let text_path = self.snapshots().join(format!("{hash}.txt"));
-        if !text_path.exists() {
-            fs::write(&text_path, text)?;
-        }
-
-        let record = VersionRecord {
-            id: format!("v{}", existing.len() + 1),
-            source_path,
+        let kind = detect_office_kind(&path)?.to_string();
+        validate_office_file(&path)?;
+        let bytes = fs::read(&path)?;
+        let staged = StagedRecord {
+            source_path: self.source_key(&path)?,
             original_name: file_name(&path)?,
-            kind: detect_office_kind(&path)?.to_string(),
-            hash,
+            kind,
+            hash: sha256_bytes(&bytes),
+            staged_at: now()?,
+            size: bytes.len() as u64,
+            snapshot: false,
+        };
+        Ok((staged, bytes))
+    }
+
+    fn snapshot_paths(&self, hash: &str) -> (PathBuf, PathBuf) {
+        (
+            self.packages().join(format!("{hash}.json")),
+            self.snapshots().join(format!("{hash}.txt")),
+        )
+    }
+
+    fn store_snapshot(&self, staged: &StagedRecord, bytes: Vec<u8>) -> Result<()> {
+        self.init()?;
+        let (manifest_path, text_path) = self.snapshot_paths(&staged.hash);
+        let mut zip = ZipArchive::new(Cursor::new(bytes))?;
+        let text = extract_package_text(&staged.kind, &mut zip)?;
+        save_office_package(&mut zip, staged, &self.blobs(), &manifest_path)?;
+        if !text_path.exists() {
+            fs::write(text_path, text)?;
+        }
+        Ok(())
+    }
+
+    fn record_version(
+        &self,
+        metadata: &mut RepositoryMetadata,
+        staged: &StagedRecord,
+        message: &str,
+    ) -> Result<Option<VersionRecord>> {
+        let existing = metadata.files.entry(staged.source_path.clone()).or_default();
+        if existing.last().is_some_and(|record| record.hash == staged.hash) {
+            return Ok(None);
+        }
+        let record = self.snapshot_record(staged, format!("v{}", existing.len() + 1), message)?;
+        existing.push(record.clone());
+        metadata.pending.remove(&staged.source_path);
+        Ok(Some(record))
+    }
+
+    fn snapshot_record(&self, staged: &StagedRecord, id: String, message: &str) -> Result<VersionRecord> {
+        let (manifest_path, text_path) = self.snapshot_paths(&staged.hash);
+        Ok(VersionRecord {
+            id,
+            source_path: staged.source_path.clone(),
+            original_name: staged.original_name.clone(),
+            kind: staged.kind.clone(),
+            hash: staged.hash.clone(),
             object_path: self.stored_key(&manifest_path),
-            storage_mode: "package".to_string(),
+            storage_mode: "package".into(),
             manifest_path: self.stored_key(&manifest_path),
             text_path: self.stored_key(&text_path),
-            message: message.to_string(),
+            message: message.into(),
             created_at: now()?,
-            size: stat.len(),
-        };
+            size: staged.size,
+        })
+    }
 
+    fn save_version(&self, file_path: &str, message: &str) -> Result<VersionRecord> {
+        let (staged, bytes) = self.read_working_file(file_path)?;
         let mut metadata = self.read_metadata()?;
-        metadata
-            .files
-            .entry(record.source_path.clone())
-            .or_default()
-            .push(record.clone());
+        if let Some(previous) = metadata.files.get(&staged.source_path)
+            .and_then(|records| records.last())
+            .filter(|record| record.hash == staged.hash)
+        {
+            return Ok(previous.clone());
+        }
+        self.store_snapshot(&staged, bytes)?;
+        let record = self.record_version(&mut metadata, &staged, message)?
+            .ok_or("The version has already been saved.")?;
         self.write_metadata(&metadata)?;
         Ok(record)
     }
@@ -507,12 +843,85 @@ impl VersionManager {
         }
     }
 
-    fn diff_records(&self, from: &VersionRecord, to: &VersionRecord) -> Result<DiffResult> {
-        let old_text =
-            fs::read_to_string(self.resolve_stored_path(&from.text_path)).unwrap_or_default();
-        let new_text =
-            fs::read_to_string(self.resolve_stored_path(&to.text_path)).unwrap_or_default();
-        let diff = TextDiff::from_lines(&old_text, &new_text);
+    fn read_manifest(&self, record: &VersionRecord) -> Result<PackageManifest> {
+        let path = self.resolve_stored_path(&record.manifest_path);
+        Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+    }
+
+    fn version_text(&self, record: &VersionRecord, manifest: &PackageManifest) -> Result<String> {
+        if !matches!(record.kind.as_str(), "docx" | "pptx") {
+            return Ok(fs::read_to_string(self.resolve_stored_path(&record.text_path))
+                .unwrap_or_default());
+        }
+
+        // Earlier snapshots may include Word instructions or PowerPoint field
+        // caches. Use the same extraction rules for both sides.
+        let parts = manifest.entries.iter().filter(|entry| !entry.dir)
+            .map(|entry| (entry.name.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let read_part = |name: &str| {
+            let entry = parts[name];
+            let hash = entry.hash.as_deref().ok_or("Missing document part hash")?;
+            let data = if entry.compressed {
+                read_blob_data(&self.blobs(), hash)?
+            } else {
+                fs::read(blob_path(&self.blobs(), hash))?
+            };
+            Ok(String::from_utf8(data)?)
+        };
+        match record.kind.as_str() {
+            "docx" => extract_docx_parts(parts.keys().copied(), read_part),
+            _ => extract_pptx_parts(parts.keys().copied(), read_part),
+        }
+    }
+
+    fn diff_base(&self, record: Option<&VersionRecord>) -> Result<(DiffVersionInfo, String, ImageEntries)> {
+        let Some(record) = record else {
+            return Ok((
+                DiffVersionInfo {
+                    id: "Empty".into(),
+                    message: "No committed version".into(),
+                    created_at: String::new(),
+                    hash: String::new(),
+                },
+                String::new(),
+                BTreeMap::new(),
+            ));
+        };
+        let manifest = self.read_manifest(record)?;
+        Ok((
+            record.into(),
+            self.version_text(record, &manifest)?,
+            Self::image_entries(&manifest),
+        ))
+    }
+
+    fn diff_records(&self, from: Option<&VersionRecord>, to: &VersionRecord, previews: bool) -> Result<DiffResult> {
+        let (from, old_text, old_images) = self.diff_base(from)?;
+        let new_manifest = self.read_manifest(to)?;
+        let images = self.diff_images(
+            &old_images,
+            &Self::image_entries(&new_manifest),
+            previews,
+            |name, hash| self.image_data_url(name, hash).ok(),
+        );
+        Ok(Self::build_diff(
+            from,
+            to.into(),
+            &old_text,
+            &self.version_text(to, &new_manifest)?,
+            images,
+        ))
+    }
+
+    fn build_diff(
+        from: DiffVersionInfo,
+        to: DiffVersionInfo,
+        old_text: &str,
+        new_text: &str,
+        all_images: Vec<DiffImage>,
+    ) -> DiffResult {
+        let diff = TextDiff::from_lines(old_text, new_text);
         let mut added_lines = 0;
         let mut removed_lines = 0;
         let mut unchanged_lines = 0;
@@ -544,7 +953,6 @@ impl VersionManager {
             });
         }
 
-        let all_images = self.diff_images(from, to)?;
         let added_images = all_images
             .iter()
             .filter(|item| item.kind == "added")
@@ -566,19 +974,9 @@ impl VersionManager {
             .filter(|item| item.kind != "unchanged")
             .collect();
 
-        Ok(DiffResult {
-            from: DiffVersionInfo {
-                id: from.id.clone(),
-                message: from.message.clone(),
-                created_at: from.created_at.clone(),
-                hash: from.hash.clone(),
-            },
-            to: DiffVersionInfo {
-                id: to.id.clone(),
-                message: to.message.clone(),
-                created_at: to.created_at.clone(),
-                hash: to.hash.clone(),
-            },
+        DiffResult {
+            from,
+            to,
             added_lines,
             removed_lines,
             unchanged_lines,
@@ -588,12 +986,17 @@ impl VersionManager {
             modified_images,
             unchanged_images,
             images,
-        })
+            package_changes: Vec::new(),
+        }
     }
 
-    fn diff_images(&self, from: &VersionRecord, to: &VersionRecord) -> Result<Vec<DiffImage>> {
-        let old_images = self.image_entries(from)?;
-        let new_images = self.image_entries(to)?;
+    fn diff_images(
+        &self,
+        old_images: &ImageEntries,
+        new_images: &ImageEntries,
+        previews: bool,
+        mut new_preview: impl FnMut(&str, &str) -> Option<String>,
+    ) -> Vec<DiffImage> {
         let mut keys = old_images.keys().cloned().collect::<BTreeSet<_>>();
         keys.extend(new_images.keys().cloned());
 
@@ -601,8 +1004,8 @@ impl VersionManager {
         for path in keys {
             let old_entry = old_images.get(&path);
             let new_entry = new_images.get(&path);
-            let old_hash = old_entry.and_then(|entry| entry.hash.clone());
-            let new_hash = new_entry.and_then(|entry| entry.hash.clone());
+            let old_hash = old_entry.map(|(hash, _)| hash.clone());
+            let new_hash = new_entry.map(|(hash, _)| hash.clone());
             let kind = match (&old_hash, &new_hash) {
                 (Some(old), Some(new)) if old == new => "unchanged",
                 (Some(_), Some(_)) => "modified",
@@ -612,7 +1015,7 @@ impl VersionManager {
             };
 
             let preview_supported = image_mime(&path).is_some();
-            let include_preview = preview_supported && kind != "unchanged";
+            let include_preview = previews && preview_supported && kind != "unchanged";
             images.push(DiffImage {
                 kind: kind.to_string(),
                 path: path.clone(),
@@ -623,31 +1026,27 @@ impl VersionManager {
                 new_data_url: new_hash
                     .as_deref()
                     .filter(|_| include_preview)
-                    .and_then(|hash| self.image_data_url(&path, hash).ok()),
+                    .and_then(|hash| new_preview(&path, hash)),
                 old_hash,
                 new_hash,
-                old_size: old_entry.and_then(|entry| entry.size),
-                new_size: new_entry.and_then(|entry| entry.size),
+                old_size: old_entry.and_then(|(_, size)| *size),
+                new_size: new_entry.and_then(|(_, size)| *size),
                 preview_supported,
             });
         }
 
-        Ok(images)
+        images
     }
 
-    fn image_entries(
-        &self,
-        record: &VersionRecord,
-    ) -> Result<BTreeMap<String, PackageManifestEntry>> {
-        let manifest: PackageManifest = serde_json::from_str(&fs::read_to_string(
-            self.resolve_stored_path(&record.manifest_path),
-        )?)?;
-        Ok(manifest
+    fn image_entries(manifest: &PackageManifest) -> ImageEntries {
+        manifest
             .entries
-            .into_iter()
+            .iter()
             .filter(|entry| !entry.dir && is_office_image_entry(&entry.name))
-            .map(|entry| (entry.name.clone(), entry))
-            .collect())
+            .filter_map(|entry| {
+                entry.hash.as_ref().map(|hash| (entry.name.clone(), (hash.clone(), entry.size)))
+            })
+            .collect()
     }
 
     fn image_data_url(&self, name: &str, hash: &str) -> Result<String> {
@@ -678,17 +1077,18 @@ impl VersionManager {
                 .extend(normalized_records);
         }
 
-        let mut staged = HashMap::new();
-        for (key, mut record) in metadata.staged {
-            let normalized_key = self.normalize_source_key(&key);
-            record.source_path = self.normalize_source_key(&record.source_path);
-            staged.insert(normalized_key, record);
-        }
-
+        let normalize_entries = |entries: HashMap<String, StagedRecord>| {
+            entries.into_iter().map(|(key, mut record)| {
+                let normalized_key = self.normalize_source_key(&key);
+                record.source_path = self.normalize_source_key(&record.source_path);
+                (normalized_key, record)
+            }).collect()
+        };
         Ok(RepositoryMetadata {
             schema_version: metadata.schema_version,
             files,
-            staged,
+            staged: normalize_entries(metadata.staged),
+            pending: normalize_entries(metadata.pending),
         })
     }
 
@@ -711,21 +1111,16 @@ impl VersionManager {
     }
 }
 
-fn save_office_package(
-    path: &Path,
-    source_hash: &str,
+fn save_office_package<R: Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    staged: &StagedRecord,
     blobs: &Path,
-    packages: &Path,
-) -> Result<PathBuf> {
-    fs::create_dir_all(blobs)?;
-    fs::create_dir_all(packages)?;
-    let manifest_path = packages.join(format!("{source_hash}.json"));
+    manifest_path: &Path,
+) -> Result<()> {
     if manifest_path.exists() {
-        return Ok(manifest_path);
+        return Ok(());
     }
 
-    let file = File::open(path)?;
-    let mut zip = ZipArchive::new(file)?;
     let mut entries = Vec::new();
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index)?;
@@ -765,13 +1160,13 @@ fn save_office_package(
 
     let manifest = PackageManifest {
         schema_version: 1,
-        source_hash: source_hash.to_string(),
-        original_name: file_name(path)?,
+        source_hash: staged.hash.clone(),
+        original_name: staged.original_name.clone(),
         created_at: now()?,
         entries,
     };
-    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
-    Ok(manifest_path)
+    fs::write(manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    Ok(())
 }
 
 fn restore_office_package(manifest_path: &Path, target_path: &Path, blobs: &Path) -> Result<()> {
@@ -878,6 +1273,26 @@ fn validate_office_file(path: &Path) -> Result<fs::Metadata> {
         .into());
     }
     Ok(stat)
+}
+
+fn is_save_metadata(name: &str) -> bool {
+    matches!(
+        name,
+        "docProps/core.xml"
+            | "docProps/app.xml"
+            | "docProps/thumbnail.jpeg"
+            | "ppt/viewProps.xml"
+            | "ppt/_rels/viewProps.xml.rels"
+    )
+}
+
+fn working_hash(path: &Path) -> Result<Option<String>> {
+    match sha256_file(path) {
+        Ok(hash) => Ok(Some(hash)),
+        Err(error) if error.downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn sha256_file(path: &Path) -> Result<String> {

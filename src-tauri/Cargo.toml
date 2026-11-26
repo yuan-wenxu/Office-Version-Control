@@ -1,13 +1,18 @@
 [package]
 name = "ovc"
-version = "2.1.1"
+version = "3.0.0"
 description = "Office file version control desktop app"
 authors = ["OVC"]
 edition = "2021"
+default-run = "ovc"
 
 [[bin]]
 name = "ovc"
 path = "src/main.rs"
+
+[[bin]]
+name = "ovc-cli"
+path = "src/cli.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -19,12 +24,15 @@ hex = "0.4"
 notify = "8.2"
 quick-xml = "0.38"
 rcgen = "0.13.2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rfd = "0.15"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 similar = "2"
 tauri = { version = "2", features = ["tray-icon"] }
+tempfile = "3"
 time = { version = "0.3", features = ["formatting"] }
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 walkdir = "2"

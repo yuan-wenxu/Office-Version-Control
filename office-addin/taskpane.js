@@ -52,8 +52,7 @@ async function saveVersion() {
   const filePath = requireValue(elements.filePath, "Current Office file path is required.");
   const message = requireValue(elements.message, "Version message is required.");
 
-  await apiPost("/api/init", { workspace });
-  const result = await apiPost("/api/save-version", { workspace, filePath, message });
+  await apiPost("/api/save-version", { workspace, filePath, message });
   elements.message.value = "";
   updateSaveButtonState();
   await loadHistory();
